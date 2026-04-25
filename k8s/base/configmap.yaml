@@ -26,12 +26,12 @@ data:
     </head>
     <body>
       <div class="card">
-        <div class="badge">DEPLOYED BY ARGOCD</div>
-        <div class="title">⎈ Web Deployment</div>
+        <div class="badge">APP OF APPS · KUSTOMIZE · ARGOCD</div>
+        <div class="title">⎈ GitOps Working</div>
         <div class="meta">
-          <div>Platform: <span class="hl">Amazon EKS</span></div>
-          <div>Region: <span class="hl">us-east-1</span></div>
-          <div>Status: <span class="hl">Healthy</span></div>
+          <div>Pattern: <span class="hl">App of Apps</span></div>
+          <div>Config: <span class="hl">Kustomize overlays</span></div>
+          <div>Deployed by: <span class="hl">ArgoCD</span></div>
         </div>
       </div>
     </body>

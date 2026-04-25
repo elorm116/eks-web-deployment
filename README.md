@@ -20,7 +20,7 @@ Service (LoadBalancer) — stable endpoint
           └── ConfigMap (HTML content)
 
 Infrastructure (Terraform):
-  VPC → private subnets → EKS cluster → managed node group (2x t3.medium)
+  VPC → private subnets → EKS cluster → managed node group (2x t3.small)
 ```
 
 ## Stack

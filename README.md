@@ -1,60 +1,72 @@
 # EKS Web Deployment
 
-Production-grade Kubernetes deployment on Amazon EKS, built with Terraform.
+Production-grade Kubernetes deployment on Amazon EKS. Infrastructure provisioned with Terraform. App deployed and managed with ArgoCD GitOps. Multi-environment support with Kustomize overlays.
 
 ## Architecture
 
 ```
-Internet
+GitHub (source of truth)
     │
-    ▼
-AWS Load Balancer (ELB)
-    │  provisioned automatically by Kubernetes
-    ▼
-Service (LoadBalancer) — stable endpoint
-    │  routes to healthy pods only
-    ├── Pod 1 (nginx:alpine)
-    ├── Pod 2 (nginx:alpine)
-    └── Pod 3 (nginx:alpine)
-          │
-          └── ConfigMap (HTML content)
-
-Infrastructure (Terraform):
-  VPC → private subnets → EKS cluster → managed node group (2x t3.small)
+    └── argocd-apps/
+            └── root-app.yaml   ← applied once manually, never again
+                    │
+                    ▼  ArgoCD reads this folder
+            web-app.yaml        ← ArgoCD creates web Application automatically
+                    │
+                    ▼  points at
+            k8s/overlays/prod/  ← Kustomize merges base + prod patches
+                    │
+                    ▼
+            EKS Cluster         ← 3 pods, LoadBalancer
+                    │
+                    ▼
+            AWS ELB             ← real public URL
 ```
 
 ## Stack
 
-- **Terraform** — infrastructure provisioning
-- **Amazon EKS** — managed Kubernetes control plane
-- **EC2 Managed Node Group** — worker nodes
-- **AWS Load Balancer** — external traffic entry point
+- **Terraform** — EKS cluster + VPC provisioning
+- **ArgoCD** — GitOps continuous delivery
+- **Kustomize** — multi-environment configuration
+- **Amazon EKS** — managed Kubernetes
+- **AWS Load Balancer** — external traffic
 - **nginx:alpine** — web server
-- **VPC CNI** — pod networking
 
 ## Project structure
 
 ```
 eks-web-deployment/
-├── vpc.tf           # VPC, subnets, NAT gateway
-├── eks.tf           # EKS cluster + addons + node group
-├── outputs.tf       # cluster endpoint, kubectl command
-├── variables.tf     # region, cluster name, instance type
-├── provider.tf      # AWS provider
+├── terraform/
+│   ├── eks.tf                  # EKS cluster + addons + node group
+│   ├── vpc.tf                  # VPC, subnets, NAT gateway
+│   ├── variables.tf            # region, cluster name, instance type
+│   ├── outputs.tf              # cluster endpoint, kubectl command
+│   └── provider.tf             # AWS provider
+├── argocd-apps/                # App of Apps — ArgoCD manages these
+│   ├── root-app.yaml           # Root Application (applied once manually)
+│   └── web-app.yaml            # Web Application (created by ArgoCD)
 └── k8s/
-    ├── configmap.yaml   # HTML content
-    ├── deployment.yaml  # 3 replicas, probes, limits
-    ├── service.yaml     # LoadBalancer — provisions real ELB
-    └── ingress.yaml     # hostname-based routing
+    ├── base/                   # Shared base manifests
+    │   ├── deployment.yaml     # 3 replicas, probes, resource limits
+    │   ├── service.yaml        # Service definition
+    │   ├── configmap.yaml      # HTML content
+    │   ├── ingress.yaml        # Ingress rules
+    │   └── kustomization.yaml  # Lists base resources
+    └── overlays/
+        ├── staging/            # Staging patches (1 replica, ClusterIP)
+        │   └── kustomization.yaml
+        └── prod/               # Prod patches (3 replicas, LoadBalancer)
+            └── kustomization.yaml
 ```
 
-## Deploy
+## How to deploy
 
 ### Prerequisites
 
 - Terraform >= 1.0
-- AWS CLI configured (`aws sts get-caller-identity`)
+- AWS CLI configured
 - kubectl installed
+- ArgoCD CLI installed (`brew install argocd`)
 
 ### 1. Provision infrastructure
 
@@ -64,102 +76,13 @@ terraform plan
 terraform apply
 ```
 
-Takes 15-20 minutes. EKS control plane takes ~10 min, node group ~5 min.
+Takes 15-20 minutes. EKS control plane ~10 min, node group ~5 min.
 
-### 2. Configure kubectl
+### 2. Configure kubectl + grant IAM access
 
 ```bash
 aws eks update-kubeconfig --region us-east-1 --name web-eks
-kubectl get nodes
-```
 
-### 3. Deploy the app
-
-```bash
-kubectl apply -f k8s/configmap.yaml
-kubectl apply -f k8s/deployment.yaml
-kubectl apply -f k8s/service.yaml
-```
-
-### 4. Get the Load Balancer URL
-
-```bash
-kubectl get svc web
-# EXTERNAL-IP column shows the ELB DNS name
-# Takes 60-90 seconds to provision
-```
-
-### 5. Hit your app
-
-```bash
-curl http://<elb-dns-name>
-```
-
-## Zero-downtime updates
-
-Update content without downtime:
-
-```bash
-# Edit k8s/configmap.yaml
-kubectl apply -f k8s/configmap.yaml
-kubectl rollout restart deployment web
-kubectl rollout status deployment web
-```
-
-Kubernetes replaces pods one at a time. Traffic keeps flowing throughout.
-
-## Self-healing demo
-
-```bash
-kubectl delete pods --all
-kubectl get pods -w
-# New pods appear in seconds
-```
-
-## Tear down
-
-```bash
-# Delete Kubernetes resources first (removes the ELB)
-kubectl delete -f k8s/
-
-# Then destroy infrastructure
-terraform destroy
-```
-
-**Always delete k8s resources before terraform destroy** — otherwise the ELB stays alive and blocks VPC deletion.
-
-## Troubleshooting
-
-### Nodes stuck NotReady after apply
-
-**Symptom:** `kubectl get nodes` shows NotReady, `kubectl get pods -n kube-system` shows nothing.
-
-**Cause:** VPC CNI addon not installed before nodes tried to join.
-
-**Fix:**
-```bash
-aws eks create-addon --cluster-name web-eks --addon-name vpc-cni --region us-east-1
-aws eks create-addon --cluster-name web-eks --addon-name kube-proxy --region us-east-1
-aws eks create-addon --cluster-name web-eks --addon-name coredns --region us-east-1
-```
-
-**Prevention:** Always include `before_compute = true` on vpc-cni in your EKS module:
-```hcl
-cluster_addons = {
-  vpc-cni = { before_compute = true }
-}
-```
-
----
-
-### kubectl returns "must be logged in to server"
-
-**Symptom:** All kubectl commands fail with credentials error after `terraform apply`.
-
-**Cause:** EKS module v20 uses access entries, not the old aws-auth ConfigMap. Your IAM user needs an explicit access entry.
-
-**Fix:**
-```bash
 aws eks create-access-entry \
   --cluster-name web-eks \
   --principal-arn $(aws sts get-caller-identity --query Arn --output text) \
@@ -171,63 +94,211 @@ aws eks associate-access-policy \
   --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy \
   --access-scope type=cluster \
   --region us-east-1
+
+kubectl get nodes
 ```
 
-**Prevention:** Add to eks.tf:
-```hcl
-enable_cluster_creator_admin_permissions = true
-```
+### 3. Install ArgoCD
 
----
-
-### Node group CREATE_FAILED
-
-**Symptom:** `aws eks describe-nodegroup` shows `CREATE_FAILED` with `NodeCreationFailure`.
-
-**Cause:** Nodes launched but couldn't register — usually CNI not ready or IAM role missing policies.
-
-**Diagnosis:**
 ```bash
-kubectl describe node <node-name> | grep -A5 "Conditions"
-# Look for: "cni plugin not initialized"
+kubectl create namespace argocd
+kubectl apply -n argocd \
+  -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
 
-aws iam list-attached-role-policies --role-name <node-role-name>
-# Should have: AmazonEKSWorkerNodePolicy, AmazonEKS_CNI_Policy, AmazonEC2ContainerRegistryReadOnly
+kubectl wait --for=condition=ready pod \
+  -l app.kubernetes.io/name=argocd-server \
+  -n argocd --timeout=120s
 ```
 
----
+### 4. Login to ArgoCD
 
-### ELB DNS not resolving immediately
-
-**Symptom:** `curl` returns empty after `kubectl apply -f k8s/service.yaml`.
-
-**Cause:** AWS ELB DNS propagation takes 2-3 minutes.
-
-**Fix:** Wait 2-3 minutes then retry. Check status:
 ```bash
-kubectl get svc web -w
-# Wait for EXTERNAL-IP to show the DNS name
+kubectl port-forward svc/argocd-server -n argocd 8080:443 &
 
-nslookup <elb-dns-name>
-# Wait until this returns an IP
+argocd login localhost:8080 \
+  --username admin \
+  --password $(kubectl -n argocd get secret argocd-initial-admin-secret \
+    -o jsonpath="{.data.password}" | base64 -d) \
+  --insecure
 ```
 
----
+### 5. Apply root app — one time only
 
-### terraform destroy hangs on VPC deletion
-
-**Symptom:** `terraform destroy` gets stuck deleting the VPC.
-
-**Cause:** The ELB created by the LoadBalancer service is still alive and attached to the VPC. Terraform doesn't know about it because kubectl created it.
-
-**Fix:** Always delete Kubernetes resources before destroying infrastructure:
 ```bash
-kubectl delete -f k8s/
-# Wait 60 seconds for ELB to de-provision
+kubectl apply -f argocd-apps/root-app.yaml
+```
+
+ArgoCD reads `argocd-apps/` from GitHub and creates the `web` Application automatically. You never run `argocd app create` again.
+
+### 6. Verify
+
+```bash
+kubectl get app -n argocd
+kubectl get pods
+kubectl get svc web
+
+# Get ELB URL
+kubectl get svc web -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+```
+
+## GitOps workflow
+
+### Deploy a change
+
+```bash
+# Edit any file in k8s/base/ or k8s/overlays/
+vim k8s/base/configmap.yaml
+
+git add .
+git commit -m "feat: update content"
+git push origin main
+
+# ArgoCD detects the new commit and deploys automatically
+# Force sync if you don't want to wait 3 minutes
+argocd app sync root
+argocd app sync web
+```
+
+### Rollback
+
+```bash
+# Find the commit to revert to
+git log --oneline
+
+# Revert
+git revert <bad-commit-hash>
+git push origin main
+
+# ArgoCD deploys the reverted state automatically
+```
+
+## Kustomize overlays
+
+### Preview what an overlay generates
+
+```bash
+# See final prod YAML (base + patches merged)
+kubectl kustomize k8s/overlays/prod
+
+# See final staging YAML
+kubectl kustomize k8s/overlays/staging
+```
+
+### What each overlay changes
+
+| Setting | Base | Staging | Production |
+|---------|------|---------|------------|
+| Replicas | 3 | 1 | 3 |
+| Memory limit | 64Mi | 32Mi | 64Mi |
+| Service type | ClusterIP | ClusterIP | LoadBalancer |
+
+## App of Apps pattern
+
+```
+root-app.yaml (applied manually once)
+    │
+    └── watches argocd-apps/ folder in GitHub
+              │
+              ├── web-app.yaml     → creates web Application
+              ├── api-app.yaml     → creates api Application (future)
+              └── monitoring.yaml  → creates monitoring Application (future)
+```
+
+Add a new service: create a new YAML file in `argocd-apps/`. ArgoCD picks it up automatically. No manual CLI commands.
+
+## Self-healing demo
+
+```bash
+# Manually break it — scale to 1 replica bypassing Git
+kubectl scale deployment web --replicas=1
+
+# ArgoCD detects drift (Git says 3, cluster has 1)
+# Automatically restores to 3 within 3 minutes
+# Or force it:
+argocd app sync web
+
+kubectl get pods  # back to 3
+```
+
+## Tear down — order matters
+
+```bash
+# Step 1: delete ArgoCD apps (removes ELB)
+kubectl delete -f argocd-apps/root-app.yaml
+kubectl delete app web -n argocd 2>/dev/null || true
+sleep 60
+
+# Step 2: destroy infrastructure
 terraform destroy
 ```
 
+Always delete Kubernetes resources before `terraform destroy`. The LoadBalancer service creates an AWS ELB — if Terraform destroys the VPC first, the ELB blocks deletion.
+
+## Troubleshooting
+
+### Nodes NotReady after apply
+
+```bash
+# Check why
+kubectl describe node <node-name> | grep -A5 "Conditions"
+# Look for: "cni plugin not initialized"
+
+# Fix: install CNI manually
+aws eks create-addon --cluster-name web-eks --addon-name vpc-cni --region us-east-1
+aws eks create-addon --cluster-name web-eks --addon-name kube-proxy --region us-east-1
+aws eks create-addon --cluster-name web-eks --addon-name coredns --region us-east-1
+```
+
+Prevention: `vpc-cni` must have `before_compute = true` in eks.tf.
+
+---
+
+### kubectl returns Unauthorized
+
+```bash
+# Grant IAM access (see step 2 above)
+aws eks create-access-entry ...
+aws eks associate-access-policy ...
+```
+
+Prevention: add `enable_cluster_creator_admin_permissions = true` to eks.tf.
+
+---
+
+### ArgoCD not picking up new commits
+
+```bash
+# Check what commit ArgoCD is on
+argocd app get web | grep "Sync Revision"
+
+# Check what's actually on GitHub
+git ls-remote https://github.com/elorm116/eks-web-deployment HEAD
+
+# Force sync
+argocd app sync web
+```
+
+Common cause: ArgoCD was pointing at wrong repo or wrong path.
+
+---
+
+### terraform destroy hangs on VPC
+
+ArgoCD or kubectl created an ELB that Terraform doesn't know about. Delete k8s resources first, wait 60 seconds, then destroy.
+
+---
+
+### ArgoCD app stuck Progressing
+
+```bash
+kubectl get pods -n argocd
+kubectl describe app web -n argocd | grep -A10 "Conditions"
+kubectl get events -n default --sort-by='.lastTimestamp'
+```
+
+Usually a pod that won't start — check events for the real error.
+
 ## Related projects
 
-- [k8s-web-deployment](https://github.com/elorm116/k8s-web-deployment) — same app on a local Kubernetes cluster (Killercoda). Good for understanding Kubernetes concepts without cloud costs.
-- [Terraform 30 Days Challenge](https://github.com/elorm116) — includes multi-region HA on EC2 + ASG + ALB + RDS. The traditional AWS approach to the same problem this project solves with Kubernetes.
+- [Terraform 30-day challenge](https://github.com/elorm116) — multi-region HA on EC2 + ASG + ALB + RDS (Day 27)
+- [k8s-web-deployment](https://github.com/elorm116/k8s-web-deployment) — same app on Killercoda, Kubernetes fundamentals

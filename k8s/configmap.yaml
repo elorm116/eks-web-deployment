@@ -26,7 +26,7 @@ data:
     </head>
     <body>
       <div class="card">
-        <div class="badge">RUNNING ON EKS</div>
+        <div class="badge">DEPLOYED BY ARGOCD</div>
         <div class="title">⎈ Web Deployment</div>
         <div class="meta">
           <div>Platform: <span class="hl">Amazon EKS</span></div>

@@ -1,0 +1,63 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: falco
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://falcosecurity.github.io/charts
+    chart: falco
+    targetRevision: 4.21.2
+    helm:
+      values: |
+        # ── Driver ────────────────────────────────────────────────────────
+        # modern-bpf runs in eBPF without kernel headers — works on EKS AL2023
+        driver:
+          kind: modern-bpf
+
+        # ── Falcosidekick — routes alerts to Slack ─────────────────────
+        falcosidekick:
+          enabled: true
+          config:
+            slack:
+              webhookurl: ""   # TODO: add SLACK_WEBHOOK_URL secret
+              minimumpriority: "warning"
+            customfields: "cluster:eks-web-deployment"
+
+        # ── Resource limits ───────────────────────────────────────────────
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+
+        # ── Extra rules — detect shell in container ───────────────────────
+        customRules:
+          custom-rules.yaml: |-
+            - rule: Shell spawned in container
+              desc: A shell was spawned in a container
+              condition: >
+                spawned_process and container
+                and shell_procs
+                and not container.image.repository in (known_shell_spawning_images)
+              output: >
+                Shell spawned in container
+                (user=%user.name container=%container.name image=%container.image.repository
+                shell=%proc.name parent=%proc.pname cmdline=%proc.cmdline)
+              priority: WARNING
+              tags: [container, shell, mitre_execution]
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: falco
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

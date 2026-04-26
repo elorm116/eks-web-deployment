@@ -19,7 +19,7 @@ spec:
         fsGroup: 101
       containers:
       - name: web
-        image: 393818036545.dkr.ecr.us-east-1.amazonaws.com/web-app@sha256:22956b90180d2c1244e477d9f562f0a2966298b03d6d60e18c7607538e23bfcf
+        image: .dkr.ecr.us-east-1.amazonaws.com/web-app@sha256:2b1fbc40a0fa34e3bffb4916c47afc40c7e278768f9c76a3357da994caeea4c2
         ports:
         - containerPort: 8080
         resources:

@@ -1,7 +1,7 @@
 name: CI/CD Pipeline
 
 on:
-  workflow_dispatch:   # enables manual triggering from GitHub UI
+  workflow_dispatch:   
   push:
     branches: [main]
     paths:
@@ -39,7 +39,7 @@ jobs:
         with:
           scan-type: fs
           scan-ref: .
-          scanners: secret          # scope to secrets only — avoids noisy dep/vuln hits
+          scanners: secret          
           format: table
           exit-code: '1'
           severity: HIGH,CRITICAL
@@ -60,10 +60,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      # Build amd64 only locally — exported as tar for the scan job.
-      # cache-to writes the GHA cache here; the ECR push step reads it only
-      # (cache-to omitted there) to avoid overwriting with an incomplete
-      # multi-arch entry that would corrupt the cache key.
+
       - name: Build and export image locally
         uses: docker/build-push-action@v7
         with:
@@ -116,7 +113,7 @@ jobs:
 
       - name: Install Cosign
         if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
-        uses: sigstore/cosign-installer@v4
+        uses: sigstore/cosign-installer@v4.1.0
 
       - name: Sign image by digest
         if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'

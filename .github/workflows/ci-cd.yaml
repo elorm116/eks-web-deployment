@@ -94,6 +94,9 @@ jobs:
 
       # provenance: false — required for multi-arch manifests on ECR;
       # ECR does not support OCI image index with provenance attestation.
+      # cache-to is omitted here intentionally — the local build above already
+      # wrote the GHA cache. A second cache-to from a different platform set
+      # (amd64+arm64 vs amd64) would overwrite it with an incomplete entry.
       - name: Build and push to ECR
         if: github.ref == 'refs/heads/main'
         id: build-ecr
@@ -108,9 +111,8 @@ jobs:
             ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:sha-${{ github.sha }}
             ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
           cache-from: type=gha
-          cache-to: type=gha,mode=max
 
-      # ── Cosign — sign image by digest inline (same job, AWS creds alive) ──
+      # ── Cosign — sign by digest (same job, AWS creds still alive) ────────
       # Signing by digest (not tag) is what Kyverno/admission controllers verify.
       # A tag is mutable — it can point to a different image tomorrow.
       # A digest is immutable — it is the SHA256 of the manifest itself.
@@ -247,4 +249,3 @@ jobs:
 
           echo "❌ Failed to push after 3 attempts"
           exit 1
-          

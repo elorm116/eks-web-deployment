@@ -1,7 +1,7 @@
 name: CI/CD Pipeline - EKS Deployment
 
 on:
-  workflow_dispatch:   
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
@@ -18,7 +18,6 @@ env:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  # Cancel in-progress runs on PRs freely; protect main deploys from cancellation
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
@@ -39,7 +38,7 @@ jobs:
         with:
           scan-type: fs
           scan-ref: .
-          scanners: secret          
+          scanners: secret
           format: table
           exit-code: '1'
           severity: HIGH,CRITICAL
@@ -50,7 +49,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: [secrets-scan]
     outputs:
-      digest: ${{ steps.build-ecr.outputs.digest }}
+      digest: ${{ steps.get-manifest-digest.outputs.digest }}
+      registry: ${{ steps.ecr-login.outputs.registry }}
     permissions:
       contents: read
       id-token: write
@@ -62,7 +62,6 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
-
 
       - name: Build and export image locally
         uses: docker/build-push-action@v7
@@ -97,7 +96,6 @@ jobs:
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-     
       - name: Build and push to ECR
         if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         id: build-ecr
@@ -106,12 +104,38 @@ jobs:
           context: app/
           platforms: linux/amd64,linux/arm64
           push: true
-          provenance: false # ECR doesn't handle OCI provenance attestation manifests cleanly
+          provenance: false  # ECR doesn't handle OCI provenance attestation manifests cleanly
           tags: |
             ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
             ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:sha-${{ github.sha }}
           cache-from: type=gha
 
+      - name: Get manifest list digest from ECR
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+        id: get-manifest-digest
+        run: |
+          # build-ecr.outputs.digest is the manifest list digest — correct for multi-arch
+          # We verify it exists in ECR and is actually a manifest list, not a platform image
+          DIGEST="${{ steps.build-ecr.outputs.digest }}"
+
+          MEDIA_TYPE=$(aws ecr describe-images \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --image-ids imageDigest=$DIGEST \
+            --region ${{ env.AWS_REGION }} \
+            --query 'imageDetails[0].imageManifestMediaType' \
+            --output text)
+
+          echo "Digest: $DIGEST"
+          echo "Media type: $MEDIA_TYPE"
+
+          # Confirm it's a manifest list — Kubernetes + containerd resolve platform automatically
+          if [[ "$MEDIA_TYPE" != *"manifest.list"* && "$MEDIA_TYPE" != *"index"* ]]; then
+            echo "❌ Expected manifest list, got: $MEDIA_TYPE"
+            exit 1
+          fi
+
+          echo "✅ Confirmed manifest list — safe to use as deployment reference"
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
 
       - name: Install Cosign
         if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
@@ -123,10 +147,10 @@ jobs:
           COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
-          DIGEST: ${{ steps.build-ecr.outputs.digest }}
+          DIGEST: ${{ steps.get-manifest-digest.outputs.digest }}
         run: |
           if [[ -z "$DIGEST" ]]; then
-            echo "❌ No digest from build step — cannot sign"
+            echo "❌ No digest — cannot sign"
             exit 1
           fi
 
@@ -135,9 +159,7 @@ jobs:
 
           echo "$COSIGN_PRIVATE_KEY" > cosign.key
           chmod 600 cosign.key
-
           cosign sign --key cosign.key "$IMAGE_REF"
-
           rm -f cosign.key
           echo "✅ Image signed successfully"
 
@@ -155,7 +177,6 @@ jobs:
       - name: Load image
         run: docker load -i /tmp/image.tar
 
-      # Step A: Full SARIF report for GitHub Security tab
       - name: Trivy scan — SARIF
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -208,7 +229,9 @@ jobs:
     name: Sync GitOps Manifest
     runs-on: ubuntu-latest
     needs: [container-scan, iac-scan, build]
-    # workflow_dispatch excluded intentionally — no head_commit on manual runs
+    permissions:
+      contents: write
+      id-token: write
     if: github.ref == 'refs/heads/main' && github.event_name == 'push' && !contains(github.event.head_commit.message, '[skip ci]')
     steps:
       - uses: actions/checkout@v6
@@ -220,6 +243,7 @@ jobs:
       - name: Update image in deployment manifest
         env:
           ECR_URL: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}
+          # manifest list digest — containerd resolves correct platform automatically
           DIGEST: ${{ needs.build.outputs.digest }}
         run: |
           git pull --rebase origin main
@@ -233,7 +257,6 @@ jobs:
           git config user.email "actions@github.com"
           git add k8s/base/deployment.yaml
 
-          # No changes means the image ref is already current — not an error
           git diff --cached --quiet && echo "No manifest changes, skipping commit." && exit 0
 
           git commit -m "chore(gitops): deploy sha-${{ github.sha }} [skip ci]"

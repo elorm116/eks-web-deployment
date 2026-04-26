@@ -25,15 +25,15 @@ permissions:
   security-events: write
 
 jobs:
-  # ── 1. Security Gates ────────────────────────────────────────────────────
+  # ── 1. Security Gate ─────────────────────────────────────────────────────
   secrets-scan:
     name: Secrets Scan — Trivy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - name: Scan for secrets and misconfigs
-        uses: aquasecurity/trivy-action@0.35.0
+      - name: Scan for secrets
+        uses: aquasecurity/trivy-action@0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -47,16 +47,16 @@ jobs:
     runs-on: ubuntu-latest
     needs: [secrets-scan]
     outputs:
-      digest: ${{ steps.build.outputs.digest }}
-      image: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
+      digest: ${{ steps.get-digest.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
-      - name: Build image locally for scanning
-        uses: docker/build-push-action@v6
+      # Build locally for scanning — no push yet
+      - name: Build image locally
+        uses: docker/build-push-action@v7
         with:
           context: app/
           platforms: linux/amd64
@@ -65,15 +65,16 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Load image
+      - name: Load image for scanning
         run: docker load -i /tmp/image.tar
 
       - name: Upload image artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: docker-image
           path: /tmp/image.tar
 
+      # Only push to ECR on main branch
       - name: Configure AWS credentials
         if: github.ref == 'refs/heads/main'
         uses: aws-actions/configure-aws-credentials@v4
@@ -84,21 +85,35 @@ jobs:
 
       - name: Login to ECR
         if: github.ref == 'refs/heads/main'
+        id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push to ECR by SHA only
+      - name: Build and push to ECR — SHA tag only, no latest
         if: github.ref == 'refs/heads/main'
-        id: build
-        uses: docker/build-push-action@v6
+        id: build-push
+        uses: docker/build-push-action@v7
         with:
           context: app/
           platforms: linux/amd64,linux/arm64
           push: true
           provenance: false
-          tags: |
-            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:sha-${{ github.sha }}
+          tags: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:sha-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Capture digest separately — more reliable than build output
+      - name: Get image digest
+        if: github.ref == 'refs/heads/main'
+        id: get-digest
+        run: |
+          DIGEST=$(aws ecr describe-images \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --image-ids imageTag=sha-${{ github.sha }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+          echo "Image digest: $DIGEST"
 
   # ── 3. Container Scan ────────────────────────────────────────────────────
   container-scan:
@@ -106,7 +121,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: docker-image
           path: /tmp
@@ -114,8 +129,8 @@ jobs:
       - name: Load image
         run: docker load -i /tmp/image.tar
 
-      - name: Trivy scan — SARIF for GitHub Security tab
-        uses: aquasecurity/trivy-action@0.35.0
+      - name: Trivy scan — SARIF
+        uses: aquasecurity/trivy-action@0.36.0
         with:
           image-ref: web-app:${{ github.sha }}
           format: sarif
@@ -123,7 +138,7 @@ jobs:
           severity: HIGH,CRITICAL
 
       - name: Trivy scan — hard fail on unfixed criticals
-        uses: aquasecurity/trivy-action@0.35.0
+        uses: aquasecurity/trivy-action@0.36.0
         with:
           image-ref: web-app:${{ github.sha }}
           format: table
@@ -131,7 +146,7 @@ jobs:
           ignore-unfixed: true
           severity: CRITICAL
 
-      - uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: trivy-results.sarif
@@ -142,7 +157,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Checkov scan
         uses: bridgecrewio/checkov-action@v12
@@ -155,11 +170,11 @@ jobs:
   sign:
     name: Sign Image — Cosign
     runs-on: ubuntu-latest
-    needs: [container-scan, iac-scan]
-    if: github.ref == 'refs/heads/main'
+    needs: [container-scan, iac-scan, build]
+    if: github.ref == 'refs/heads/main' && needs.build.outputs.digest != ''
     steps:
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -169,49 +184,51 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@v4
 
       - name: Sign image by digest
         env:
           COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
           DIGEST: ${{ needs.build.outputs.digest }}
-          IMAGE: ${{ needs.build.outputs.image }}
+          IMAGE_REF: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
         run: |
+          echo "Signing: $IMAGE_REF@$DIGEST"
           echo "$COSIGN_PRIVATE_KEY" > cosign.key
-          cosign sign --key cosign.key "$IMAGE@$DIGEST"
+          cosign sign --key cosign.key "$IMAGE_REF@$DIGEST"
           rm -f cosign.key
-          echo "Signed: $IMAGE@$DIGEST"
+          echo "✅ Image signed successfully"
 
-  # ── 6. Deploy — update gitops manifest ──────────────────────────────────
+  # ── 6. Deploy ────────────────────────────────────────────────────────────
   deploy:
     name: Update GitOps Manifest
     runs-on: ubuntu-latest
     needs: [sign, build]
     if: github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, '[skip ci]')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           token: ${{ secrets.GH_TOKEN }}
           fetch-depth: 0
 
-      - name: Update image digest in prod overlay
+      - name: Update image in deployment.yaml
         env:
-          IMAGE: ${{ needs.build.outputs.image }}
+          IMAGE_REF: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
           DIGEST: ${{ needs.build.outputs.digest }}
         run: |
           git pull --rebase origin main
 
-          # Update deployment with digest — immutable, cryptographically verified
-          sed -i "s|image:.*|image: $IMAGE@$DIGEST|g" \
+          # Update with digest — immutable reference
+          sed -i "s|image:.*web-app.*|image: $IMAGE_REF@$DIGEST|g" \
             k8s/base/deployment.yaml
+
+          cat k8s/base/deployment.yaml | grep "image:"
 
           git config user.name "github-actions[bot]"
           git config user.email "actions@github.com"
           git add k8s/base/deployment.yaml
           git commit -m "ci: deploy sha-${{ github.sha }} [skip ci]" || exit 0
 
-          # Retry push with rebase on conflict
           for i in 1 2 3; do
             if git push origin main; then exit 0; fi
             echo "Push failed, retrying ($i/3)..."

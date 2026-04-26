@@ -125,13 +125,19 @@ jobs:
         env:
           COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
-          IMAGE_REF: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}@${{ steps.build-ecr.outputs.digest }}
+          # Pass the parts separately — IMAGE_REF is assembled in the shell
+          # after digest validation. Constructing it in env: is unsafe because
+          # env: is rendered at template time, before the shell runs, so an
+          # empty digest produces "registry/repo@" and cosign fails immediately.
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          DIGEST: ${{ steps.build-ecr.outputs.digest }}
         run: |
-          if [[ -z "${{ steps.build-ecr.outputs.digest }}" ]]; then
+          if [[ -z "$DIGEST" ]]; then
             echo "❌ No digest from build step — cannot sign"
             exit 1
           fi
 
+          IMAGE_REF="$REGISTRY/${{ env.ECR_REPOSITORY }}@$DIGEST"
           echo "Signing: $IMAGE_REF"
 
           echo "$COSIGN_PRIVATE_KEY" > cosign.key

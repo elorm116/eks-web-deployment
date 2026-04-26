@@ -13,3 +13,9 @@ variable "node_instance_type" {
 variable "desired_nodes" {
   default = 2
 }
+
+variable "ecr_repository_name" {
+  description = "Name of the ECR repository the pipeline pushes to"
+  type        = string
+  default     = "web-app"
+}

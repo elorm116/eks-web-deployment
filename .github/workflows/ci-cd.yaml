@@ -1,6 +1,7 @@
 name: CI/CD Pipeline
 
 on:
+  workflow_dispatch:   # enables manual triggering from GitHub UI
   push:
     branches: [main]
     paths:
@@ -17,6 +18,7 @@ env:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancel in-progress runs on PRs freely; protect main deploys from cancellation
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
@@ -42,7 +44,7 @@ jobs:
           exit-code: '1'
           severity: HIGH,CRITICAL
 
-  # ── 2. Build & Push ───────────────────────────────────────────────────────
+  # ── 2. Build & Push ──────────────────────────────────────────────────────
   build:
     name: Build & Push to ECR
     runs-on: ubuntu-latest
@@ -58,7 +60,10 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      # ── Build locally for scanning (amd64 only, no push) ─────────────────
+      # Build amd64 only locally — exported as tar for the scan job.
+      # cache-to writes the GHA cache here; the ECR push step reads it only
+      # (cache-to omitted there) to avoid overwriting with an incomplete
+      # multi-arch entry that would corrupt the cache key.
       - name: Build and export image locally
         uses: docker/build-push-action@v7
         with:
@@ -78,9 +83,9 @@ jobs:
           name: docker-image
           path: /tmp/image.tar
 
-      # ── ECR — authenticate & push (main only) ────────────────────────────
+      # ── ECR push — main branch and manual triggers only ──────────────────
       - name: Configure AWS credentials
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         uses: aws-actions/configure-aws-credentials@v6
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -88,17 +93,13 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      # provenance: false — required for multi-arch manifests on ECR;
-      # ECR does not support OCI image index with provenance attestation.
-      # cache-to is omitted here intentionally — the local build above already
-      # wrote the GHA cache. A second cache-to from a different platform set
-      # (amd64+arm64 vs amd64) would overwrite it with an incomplete entry.
+     
       - name: Build and push to ECR
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         id: build-ecr
         uses: docker/build-push-action@v7
         with:
@@ -112,23 +113,16 @@ jobs:
             ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
           cache-from: type=gha
 
-      # ── Cosign — sign by digest (same job, AWS creds still alive) ────────
-      # Signing by digest (not tag) is what Kyverno/admission controllers verify.
-      # A tag is mutable — it can point to a different image tomorrow.
-      # A digest is immutable — it is the SHA256 of the manifest itself.
+
       - name: Install Cosign
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         uses: sigstore/cosign-installer@v4
 
       - name: Sign image by digest
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         env:
           COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
-          # Pass the parts separately — IMAGE_REF is assembled in the shell
-          # after digest validation. Constructing it in env: is unsafe because
-          # env: is rendered at template time, before the shell runs, so an
-          # empty digest produces "registry/repo@" and cosign fails immediately.
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
           DIGEST: ${{ steps.build-ecr.outputs.digest }}
         run: |
@@ -162,7 +156,7 @@ jobs:
       - name: Load image
         run: docker load -i /tmp/image.tar
 
-      # Step A: Full report for GitHub Security tab
+      # Step A: Full SARIF report for GitHub Security tab
       - name: Trivy scan — SARIF
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -172,7 +166,6 @@ jobs:
           output: trivy-results.sarif
           severity: HIGH,CRITICAL
 
-      # Step B: Hard gate — fail on unfixed criticals only
       - name: Trivy scan — enforcement gate
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -216,6 +209,7 @@ jobs:
     name: Sync GitOps Manifest
     runs-on: ubuntu-latest
     needs: [container-scan, iac-scan, build]
+    # workflow_dispatch excluded intentionally — no head_commit on manual runs
     if: github.ref == 'refs/heads/main' && github.event_name == 'push' && !contains(github.event.head_commit.message, '[skip ci]')
     steps:
       - uses: actions/checkout@v6

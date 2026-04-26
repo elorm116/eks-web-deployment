@@ -6,4 +6,7 @@
 *.tfvars.json
 *.log
 *.tfplan
-*.tfplan.out
+*.tfplan.out.terraform/
+*.tfstate
+*.tfstate.backup
+*.tflock

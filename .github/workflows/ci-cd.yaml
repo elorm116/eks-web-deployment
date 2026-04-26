@@ -13,11 +13,10 @@ on:
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: web-app
-  ECR_REGISTRY: 393818036545.dkr.ecr.us-east-1.amazonaws.com
+  IMAGE_NAME: web-app
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  # Keep in-progress deploys on main alive; cancel freely on PRs
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
@@ -33,41 +32,44 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Scan for secrets only
+      - name: Scan for secrets
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
-          scanners: secret          # scope to secrets — avoids noisy dep/vuln hits
+          scanners: secret          # scope to secrets only — avoids noisy dep/vuln hits
           format: table
           exit-code: '1'
           severity: HIGH,CRITICAL
 
-  # ── 2. Build ─────────────────────────────────────────────────────────────
+  # ── 2. Build & Push ───────────────────────────────────────────────────────
   build:
     name: Build & Push to ECR
     runs-on: ubuntu-latest
     needs: [secrets-scan]
     outputs:
-      digest: ${{ steps.build-push.outputs.digest }}
+      digest: ${{ steps.build-ecr.outputs.digest }}
     steps:
       - uses: actions/checkout@v6
+
+      - name: Set up QEMU (multi-arch)
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      # Build locally (amd64 only) and export as tar for the scan job
-      - name: Build image locally for scanning
+      # ── Build locally for scanning (amd64 only, no push) ─────────────────
+      - name: Build and export image locally
         uses: docker/build-push-action@v7
         with:
           context: app/
           platforms: linux/amd64
-          tags: web-app:${{ github.sha }}
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
           outputs: type=docker,dest=/tmp/image.tar
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Load image for smoke-check
+      - name: Load image into Docker daemon
         run: docker load -i /tmp/image.tar
 
       - name: Upload image artifact for scan job
@@ -76,38 +78,67 @@ jobs:
           name: docker-image
           path: /tmp/image.tar
 
-      # ── ECR push (main branch only) ──────────────────────────────────────
-      - name: Configure AWS credentials (OIDC)
+      # ── ECR — authenticate & push (main only) ────────────────────────────
+      - name: Configure AWS credentials
         if: github.ref == 'refs/heads/main'
         uses: aws-actions/configure-aws-credentials@v6
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}   # OIDC — no static keys
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Login to ECR
+      - name: Login to Amazon ECR
         if: github.ref == 'refs/heads/main'
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
       # provenance: false — required for multi-arch manifests on ECR;
       # ECR does not support OCI image index with provenance attestation.
-      - name: Build and push to ECR — SHA tag only
+      - name: Build and push to ECR
         if: github.ref == 'refs/heads/main'
-        id: build-push
+        id: build-ecr
         uses: docker/build-push-action@v7
         with:
           context: app/
           platforms: linux/amd64,linux/arm64
           push: true
           provenance: false
-          tags: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:sha-${{ github.sha }}
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:sha-${{ github.sha }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Debug digest from build action
+      # ── Cosign — sign image by digest inline (same job, AWS creds alive) ──
+      # Signing by digest (not tag) is what Kyverno/admission controllers verify.
+      # A tag is mutable — it can point to a different image tomorrow.
+      # A digest is immutable — it is the SHA256 of the manifest itself.
+      - name: Install Cosign
         if: github.ref == 'refs/heads/main'
+        uses: sigstore/cosign-installer@v4
+
+      - name: Sign image by digest
+        if: github.ref == 'refs/heads/main'
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          IMAGE_REF: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}@${{ steps.build-ecr.outputs.digest }}
         run: |
-          echo "Digest received: ${{ steps.build-push.outputs.digest }}"
+          if [[ -z "${{ steps.build-ecr.outputs.digest }}" ]]; then
+            echo "❌ No digest from build step — cannot sign"
+            exit 1
+          fi
+
+          echo "Signing: $IMAGE_REF"
+
+          echo "$COSIGN_PRIVATE_KEY" > cosign.key
+          chmod 600 cosign.key
+
+          cosign sign --key cosign.key "$IMAGE_REF"
+
+          rm -f cosign.key
+          echo "✅ Image signed successfully"
 
   # ── 3. Container Scan ────────────────────────────────────────────────────
   container-scan:
@@ -123,19 +154,21 @@ jobs:
       - name: Load image
         run: docker load -i /tmp/image.tar
 
-      - name: Trivy scan — SARIF upload
+      # Step A: Full report for GitHub Security tab
+      - name: Trivy scan — SARIF
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: web-app:${{ github.sha }}
-          scanners: vuln            
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          scanners: vuln
           format: sarif
           output: trivy-results.sarif
           severity: HIGH,CRITICAL
 
-      - name: Trivy scan — hard fail on unfixed criticals
+      # Step B: Hard gate — fail on unfixed criticals only
+      - name: Trivy scan — enforcement gate
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: web-app:${{ github.sha }}
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
           scanners: vuln
           format: table
           exit-code: '1'
@@ -170,68 +203,27 @@ jobs:
         with:
           sarif_file: checkov-results.sarif
 
-  # ── 5. Sign image ────────────────────────────────────────────────────────
-  sign:
-    name: Sign Image — Cosign
+  # ── 5. Deploy — GitOps Manifest Update ───────────────────────────────────
+  deploy:
+    name: Sync GitOps Manifest
     runs-on: ubuntu-latest
     needs: [container-scan, iac-scan, build]
-    if: github.ref == 'refs/heads/main' && needs.build.outputs.digest != ''
-    steps:
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v6
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to ECR
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@v4
-
-      - name: Sign image by digest
-        env:
-          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
-          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
-          DIGEST: ${{ needs.build.outputs.digest }}
-          IMAGE_REF: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
-        run: |
-          if [[ -z "$DIGEST" ]]; then
-            echo "❌ No digest received from build job"
-            echo "Digest value: '${DIGEST}'"
-            exit 1
-          fi
-
-          echo "Signing: $IMAGE_REF@$DIGEST"
-
-          echo "$COSIGN_PRIVATE_KEY" > cosign.key
-          chmod 600 cosign.key
-
-          cosign sign --key cosign.key "$IMAGE_REF@$DIGEST"
-
-          rm -f cosign.key
-          echo "✅ Image signed successfully with digest $DIGEST"
-
-  # ── 6. Deploy ────────────────────────────────────────────────────────────
-  deploy:
-    name: Update GitOps Manifest
-    runs-on: ubuntu-latest
-    needs: [sign, build]
-    if: github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, '[skip ci]')
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && !contains(github.event.head_commit.message, '[skip ci]')
     steps:
       - uses: actions/checkout@v6
         with:
           token: ${{ secrets.GH_TOKEN }}
+          ref: main
           fetch-depth: 0
 
-      - name: Update image in deployment.yaml
+      - name: Update image in deployment manifest
         env:
-          IMAGE_REF: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
+          ECR_URL: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}
           DIGEST: ${{ needs.build.outputs.digest }}
         run: |
           git pull --rebase origin main
 
-          sed -i "s|image:.*web-app.*|image: $IMAGE_REF@$DIGEST|g" \
+          sed -i -E "s|^([[:space:]]*)image:.*web-app.*|\1image: $ECR_URL@$DIGEST|" \
             k8s/base/deployment.yaml
 
           grep "image:" k8s/base/deployment.yaml
@@ -240,17 +232,19 @@ jobs:
           git config user.email "actions@github.com"
           git add k8s/base/deployment.yaml
 
-          # Nothing to commit means image ref unchanged — not an error
-          git diff --cached --quiet && echo "No manifest changes, skipping commit" && exit 0
+          # No changes means the image ref is already current — not an error
+          git diff --cached --quiet && echo "No manifest changes, skipping commit." && exit 0
 
-          git commit -m "ci: deploy sha-${{ github.sha }} [skip ci]"
+          git commit -m "chore(gitops): deploy sha-${{ github.sha }} [skip ci]"
 
-          # Retry push up to 3 times in case of a concurrent commit race
           for i in 1 2 3; do
-            git push origin main && exit 0
-            echo "Push failed (attempt $i/3), rebasing..."
+            if git push origin main; then
+              exit 0
+            fi
+            echo "Push failed; rebasing and retrying ($i/3)..."
             git pull --rebase origin main
           done
 
           echo "❌ Failed to push after 3 attempts"
           exit 1
+          

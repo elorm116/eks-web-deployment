@@ -1,4 +1,4 @@
-name: CI/CD Pipeline
+name: CI/CD Pipeline - EKS Deployment
 
 on:
   workflow_dispatch:   

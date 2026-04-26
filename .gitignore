@@ -10,3 +10,9 @@
 *.tfstate
 *.tfstate.backup
 *.tflock
+bootstrap-s3/terraform.tfstate
+bootstrap-s3/.terraform/
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/.terraform/
+cosign.key

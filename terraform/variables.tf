@@ -11,7 +11,7 @@ variable "node_instance_type" {
 }
 
 variable "desired_nodes" {
-  default = 2
+  default = 3
 }
 
 variable "ecr_repository_name" {

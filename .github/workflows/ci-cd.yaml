@@ -33,7 +33,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Scan for secrets
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -49,7 +49,7 @@ jobs:
     outputs:
       digest: ${{ steps.get-digest.outputs.digest }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -77,7 +77,7 @@ jobs:
       # Only push to ECR on main branch
       - name: Configure AWS credentials
         if: github.ref == 'refs/heads/main'
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -101,7 +101,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Capture digest separately — more reliable than build output
+      # Capture digest reliably
       - name: Get image digest
         if: github.ref == 'refs/heads/main'
         id: get-digest
@@ -112,8 +112,14 @@ jobs:
             --region ${{ env.AWS_REGION }} \
             --query 'imageDetails[0].imageDigest' \
             --output text)
+
+          if [[ -z "$DIGEST" || "$DIGEST" == "None" || "$DIGEST" == "null" ]]; then
+            echo "❌ Failed to retrieve image digest from ECR"
+            exit 1
+          fi
+
           echo "digest=$DIGEST" >> $GITHUB_OUTPUT
-          echo "Image digest: $DIGEST"
+          echo "✅ Image digest: $DIGEST"
 
   # ── 3. Container Scan ────────────────────────────────────────────────────
   container-scan:
@@ -130,7 +136,7 @@ jobs:
         run: docker load -i /tmp/image.tar
 
       - name: Trivy scan — SARIF
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: web-app:${{ github.sha }}
           format: sarif
@@ -138,7 +144,7 @@ jobs:
           severity: HIGH,CRITICAL
 
       - name: Trivy scan — hard fail on unfixed criticals
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: web-app:${{ github.sha }}
           format: table
@@ -193,11 +199,21 @@ jobs:
           DIGEST: ${{ needs.build.outputs.digest }}
           IMAGE_REF: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
         run: |
+          if [[ -z "$DIGEST" || "$DIGEST" == "null" || "$DIGEST" == "None" ]]; then
+            echo "❌ DIGEST is empty or null. Cannot sign image."
+            echo "DIGEST value received: '$DIGEST'"
+            exit 1
+          fi
+
           echo "Signing: $IMAGE_REF@$DIGEST"
+
           echo "$COSIGN_PRIVATE_KEY" > cosign.key
+          chmod 600 cosign.key
+
           cosign sign --key cosign.key "$IMAGE_REF@$DIGEST"
+
           rm -f cosign.key
-          echo "✅ Image signed successfully"
+          echo "✅ Image signed successfully with digest $DIGEST"
 
   # ── 6. Deploy ────────────────────────────────────────────────────────────
   deploy:
